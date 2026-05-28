@@ -1,21 +1,14 @@
-# --- 1. 环境补丁 (必须放在最顶端) ---
-try:
-    __import__('pysqlite3')
-    import sys
-    sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
-except ImportError:
-    # 本地 Windows 环境可能没有 pysqlite3，忽略即可
-    pass
-
 import streamlit as st
 import os
 import json
 import warnings
 import tempfile
-import shutil
 from datetime import datetime
 
-# 导入核心组件
+# --- 1. 基础环境配置 ---
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_openai import ChatOpenAI
@@ -23,13 +16,14 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
 
+DB_PATH = "./drug_db"
+os.makedirs(DB_PATH, exist_ok=True)
+
 # --- 2. 逻辑类定义 ---
 
 class KnowledgeManager:
-    """知识库管理：负责 PDF 解析、向量化存储与检索"""
     def __init__(self, model_name, db_path):
-        self.db_path = db_path
-        # 使用多语言轻量化模型，适合 Streamlit Cloud 内存限制
+        print(f"[{datetime.now()}] 📦 初始化检索模型...")
         self.embeddings = HuggingFaceEmbeddings(
             model_name=model_name,
             model_kwargs={'device': 'cpu'}
@@ -40,169 +34,151 @@ class KnowledgeManager:
         )
 
     def upload_docs(self, file_path):
-        """解析单份 PDF 并存入向量库"""
         loader = PyPDFLoader(file_path)
         docs = loader.load()
-        splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=120)
+        splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=150)
         splits = splitter.split_documents(docs)
         self.vectorstore.add_documents(splits)
         return len(splits)
 
     def retrieve_context(self, query):
-        """检索相关知识"""
-        try:
-            # 检查数据库是否为空
-            count = self.vectorstore._collection.count()
-            if count == 0:
-                return "（提醒：当前知识库为空，审核将仅依赖 AI 通识）"
-            
-            results = self.vectorstore.similarity_search(query, k=3)
-            return "\n".join([res.page_content for res in results])
-        except Exception:
-            return "（检索失败或知识库未初始化）"
+        results = self.vectorstore.similarity_search(query, k=3)
+        return "\n".join([res.page_content for res in results])
 
 class PharmacyAgent:
-    """AI 药师核心逻辑"""
-    def __init__(self, api_key, base_url="https://api.deepseek.com"):
+    def __init__(self, api_key, base_url):
+        clean_key = str(api_key).strip()
         self.llm = ChatOpenAI(
             model="deepseek-chat",
-            api_key=api_key.strip(),
+            api_key=clean_key,
             base_url=base_url,
-            temperature=0,
-            max_retries=2
+            temperature=0
         )
 
     def audit(self, prescription_json, context):
-        system_instruction = """你是一位极其严谨的资深临床药师。请根据【参考资料】审核【处方数据】。
-        
-        ### 审核要求：
-        1. **儿科剂量复核**：针对 <18岁患者，必须根据 weight(体重) 核算剂量。
-           - 必须列出计算公式：[推荐标准(mg/kg)] × [患者体重(kg)] = [每日/每次应给剂量]。
-        2. **医保合规性**：核对 diagnosis(诊断) 是否符合资料中的“医保支付范围”。
-        3. **安全性检查**：检查频次、给药途径及是否有重复用药或禁忌。
-
-        ### 请按以下结构输出报告：
-        #### 1️⃣ 剂量复核 (含详细计算公式)
-        #### 2️⃣ 医保支付合规性核对
-        #### 3️⃣ 药学审核结论
-        #### 4️⃣ 修改建议"""
-
-        prompt = ChatPromptTemplate.from_template(
-            "系统指引：{system}\n\n参考资料：{context}\n\n待审处方数据：{prescription}"
-        )
+        system_prompt = """你是一位资深临床药师。请根据【参考资料】审核【处方数据】。
+        必须核算儿科剂量(weight)并检查社保合规性(diagnosis)。"""
+        prompt = ChatPromptTemplate.from_template(system_prompt + "\n\n资料: {context}\n处方: {prescription}")
         chain = prompt | self.llm
-        
-        response = chain.invoke({
-            "system": system_instruction,
+        return chain.invoke({
             "context": context,
             "prescription": json.dumps(prescription_json, ensure_ascii=False, indent=2)
-        })
-        return response.content
+        }).content
 
-# --- 3. 资源缓存与初始化 ---
+# --- 3. 缓存初始化 ---
 
 @st.cache_resource
-def get_km():
-    """缓存知识库管理器，避免重复加载嵌入模型"""
-    DB_PATH = "./drug_db"
-    if not os.path.exists(DB_PATH):
-        os.makedirs(DB_PATH)
-    # 使用该模型因为它在处理中文和多语言时体积适中且准确度高
+def get_knowledge_manager():
     model_name = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     return KnowledgeManager(model_name, DB_PATH)
 
-# --- 4. 主界面展示 ---
+# --- 4. Streamlit UI 界面 ---
 
 def main():
-    st.set_page_config(page_title="AI 智能审方系统", layout="wide", page_icon="💊")
+    st.set_page_config(page_title="AI 药师审方系统", layout="wide", page_icon="💊")
     
-    # 初始化知识库
-    km = get_km()
+    km = get_knowledge_manager()
 
-    # --- 侧边栏 ---
-    st.sidebar.title("⚙️ 系统管理")
+    # --- 登录逻辑 ---
+    st.sidebar.title("🔐 系统登录")
     
-    api_key = st.sidebar.text_input("请输入 DeepSeek API Key:", type="password")
-    
-    st.sidebar.markdown("---")
-    st.sidebar.header("📚 知识库更新")
-    uploaded_files = st.sidebar.file_uploader("上传 PDF 资料 (医保目录/说明书)", type="pdf", accept_multiple_files=True)
-    
-    if uploaded_files:
-        if st.sidebar.button("开始学习新资料"):
-            for file in uploaded_files:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                    tmp.write(file.getvalue())
-                    tmp_path = tmp.name
-                with st.sidebar:
-                    with st.spinner(f"正在解析: {file.name}..."):
-                        km.upload_docs(tmp_path)
-                os.unlink(tmp_path)
-            st.sidebar.success("资料入库成功！")
+    if 'api_key' not in st.session_state:
+        st.session_state['api_key'] = ""
 
-    if st.sidebar.button("清空本地数据库"):
-        if os.path.exists("./drug_db"):
-            shutil.rmtree("./drug_db")
+    input_key = st.sidebar.text_input(
+        "请输入 DeepSeek API Key:", 
+        type="password", 
+        placeholder="sk-...",
+        value=st.session_state['api_key']
+    )
+
+    if not input_key:
+        st.info("👋 欢迎！请在侧边栏输入您的 DeepSeek API Key 以激活 AI 药师。")
+        st.stop()
+    else:
+        st.session_state['api_key'] = input_key
+        agent = PharmacyAgent(st.session_state['api_key'], "https://api.deepseek.com")
+
+    # --- 主界面 ---
+    st.title("🏥 药剂科 AI 处方审核平台")
+    st.markdown("---")
+
+    # 侧边栏：知识库管理（此处已修改为支持批量上传）
+    with st.sidebar:
+        st.header("📂 知识库管理")
+        # 修改点：添加 accept_multiple_files=True
+        uploaded_files = st.file_uploader("批量上传说明书 (PDF)", type="pdf", accept_multiple_files=True)
+        
+        if uploaded_files:
+            if st.button("✨ 立即同步所有知识"):
+                total_splits = 0
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                for i, uploaded_file in enumerate(uploaded_files):
+                    status_text.text(f"正在处理第 {i+1}/{len(uploaded_files)} 个文件: {uploaded_file.name}")
+                    
+                    # 使用临时文件处理
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                        tmp.write(uploaded_file.getvalue())
+                        tmp_path = tmp.name
+                    
+                    try:
+                        count = km.upload_docs(tmp_path)
+                        total_splits += count
+                    finally:
+                        if os.path.exists(tmp_path):
+                            os.unlink(tmp_path)
+                    
+                    # 更新进度条
+                    progress_bar.progress((i + 1) / len(uploaded_files))
+                
+                status_text.empty()
+                st.success(f"✅ 处理完成！共从 {len(uploaded_files)} 个文件中学习了 {total_splits} 条知识点。")
+        
+        if st.button("🚪 退出登录"):
+            st.session_state['api_key'] = ""
             st.rerun()
 
-    # --- 主页面内容 ---
-    st.title("🏥 临床药师 AI 处方审核平台")
-    st.info("本系统支持：儿科剂量自动换算、医保限定范围核对、用法用量安全性评价。")
+    # 主界面：处方录入
+    col_in, col_out = st.columns([1, 1.2])
 
-    if not api_key:
-        st.warning("⚠️ 请先在侧边栏输入 API Key 以激活 AI 审核功能。")
-        st.stop()
-
-    agent = PharmacyAgent(api_key)
-
-    col1, col2 = st.columns([1, 1.2])
-
-    with col1:
-        st.subheader("📋 处方信息录入")
-        with st.form("rx_input"):
-            c1, c2 = st.columns(2)
-            age = c1.number_input("年龄 (岁)", 0, 120, 5)
-            weight = c2.number_input("体重 (kg)", 0.0, 200.0, 18.0)
+    with col_in:
+        st.subheader("📋 录入处方")
+        with st.form("audit_form"):
+            r1 = st.columns(2)
+            age = r1[0].number_input("年龄", value=5, min_value=0)
+            weight = r1[1].number_input("体重 (kg)", value=18.0)
             
-            diagnosis = st.text_input("临床诊断", "急性支气管炎")
+            r2 = st.columns(2)
+            diagnosis = r2[0].text_input("临床诊断", value="急性支气管炎")
+            insurance = r2[1].selectbox("医保类型", ["统筹医保", "自费", "门诊大病"])
             
-            st.write("**药品明细**")
-            med_name = st.text_input("药品名称", "阿奇霉素干混悬剂")
-            dosage = st.text_input("单次剂量 (例如: 0.25g)", "0.25g")
-            freq = st.selectbox("给药频次", ["QD (一日一次)", "BID (一日两次)", "TID (一日三次)", "ST! (立即使用)"])
+            st.markdown("---")
+            med_name = st.text_input("药品名称", value="阿奇霉素")
+            dosage = st.text_input("单次剂量", value="250mg")
+            freq = st.text_input("给药频次", value="一日一次")
             
-            submitted = st.form_submit_button("🧪 提交 AI 智能审核")
+            btn = st.form_submit_button("🧪 提交审核")
 
-    with col2:
-        st.subheader("📑 审核报告")
-        if submitted:
-            rx_data = {
-                "patient": {"age": age, "weight": weight, "diagnosis": diagnosis},
+    with col_out:
+        st.subheader("📝 审核报告")
+        if btn:
+            prescription = {
+                "patient": {"age": age, "weight": weight, "diagnosis": diagnosis, "insurance_type": insurance},
                 "medications": [{"name": med_name, "dosage": dosage, "frequency": freq}]
             }
             
-            with st.spinner("🔍 正在检索相关规范并分析..."):
-                # 1. 检索知识库
-                search_query = f"{med_name} {diagnosis} 儿童剂量 医保报销限定"
-                context = km.retrieve_context(search_query)
-                
-                # 2. 调用 AI 审核
+            with st.spinner("AI 药师分析中..."):
+                context = km.retrieve_context(med_name)
                 try:
-                    report = agent.audit(rx_data, context)
-                    
-                    # 3. 展示结果
-                    st.success("分析完成")
+                    report = agent.audit(prescription, context)
                     st.markdown(report)
-                    
-                    # 下载功能
-                    st.download_button(
-                        label="📥 导出审核报告",
-                        data=report,
-                        file_name=f"审方报告_{med_name}_{datetime.now().strftime('%H%M')}.md",
-                        mime="text/markdown"
-                    )
+                    st.download_button("📥 导出报告", report, file_name=f"报告_{med_name}.txt")
                 except Exception as e:
-                    st.error(f"审核过程发生错误: {str(e)}")
+                    st.error(f"审核失败。错误详情: {e}")
+        else:
+            st.info("请在左侧录入数据。")
 
 if __name__ == "__main__":
     main()
