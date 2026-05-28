@@ -6,5 +6,5 @@ langchain-chroma
 langchain-huggingface
 sentence-transformers
 pypdf
-torch
-torchvision  <-- 必须包含这个，哪怕不用它
+torchvision
+pysqlite3-binary
