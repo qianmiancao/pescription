@@ -5,8 +5,5 @@ langchain-huggingface
 langchain-community
 langchain-text-splitters
 sentence-transformers
-huggingface_hub
 pypdf
-modelscope
-protobuf~=4.24.4
 pydantic>=2.0
