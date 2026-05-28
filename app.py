@@ -1,3 +1,14 @@
+# --- 解决部分环境 SQLite 版本过低的问题 ---
+try:
+    __import__('pysqlite3')
+    import sys
+    sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
+except ImportError:
+    pass 
+
+import streamlit as st
+import os
+# ... 其余后续 import 代码
 import streamlit as st
 import os
 import json
