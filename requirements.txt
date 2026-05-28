@@ -1,0 +1,8 @@
+streamlit
+langchain-openai
+langchain-chroma
+langchain-huggingface
+langchain-community
+langchain-text-splitters
+pypdf
+modelscope
