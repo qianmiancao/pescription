@@ -1,10 +1,9 @@
 streamlit
 langchain
-langchain-community
 langchain-openai
 langchain-chroma
 langchain-huggingface
 sentence-transformers
 pypdf
-torchvision
 pysqlite3-binary
+torchvision
